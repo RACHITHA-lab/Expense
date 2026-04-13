@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Query, HTTPException
-from database import inventory_collection, sales_collection
+from database import inventory_collection, sales_collection, product_collection
 from utils.predict import predict_demand
 from typing import Optional
 import os
@@ -138,19 +138,45 @@ def generate_recommendation(stock, predicted):
         return "Stock Balanced"
 
 
+def get_last_sale_date(product_id):
+    all_sales = list(sales_collection.find({"productId": product_id}).sort("saleDate", -1))
+    if not all_sales:
+        return None
+    sale_date = all_sales[0].get("saleDate")
+    if sale_date:
+        if isinstance(sale_date, str):
+            try:
+                return datetime.fromisoformat(sale_date.replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                return None
+        if isinstance(sale_date, datetime):
+             if sale_date.tzinfo is not None:
+                 return sale_date.replace(tzinfo=None)
+             return sale_date
+    return None
+
 def detect_dead_stock(product_id):
-    """Detect if product is not selling at all by checking sales collection."""
-    last_30_days = datetime.now() - timedelta(days=30)
+    inventory_data = list(inventory_collection.find({"productId": product_id}, {"_id": 0}))
     
-    try:
-        sales = list(sales_collection.find({
-            "productId": product_id,
-            "saleDate": {"$gte": last_30_days}
-        }))
-        return len(sales) == 0
-    except:
-        # Fallback: check last_30_days_sales field if saleDate not available
+    # Total stock calculation across all branches
+    total_stock = sum(item.get("stockQuantity", 0) for item in inventory_data)
+    
+    # Fetch last sale date
+    last_sale = get_last_sale_date(product_id)
+    
+    # Case 1: No stock → NOT dead stock
+    if total_stock <= 0:
         return False
+        
+    # Case 2: No sales data → NEW PRODUCT (not dead)
+    if not last_sale:
+        return "NEW_PRODUCT"
+        
+    # Case 3: Check 30 days inactivity
+    if last_sale < datetime.now() - timedelta(days=30):
+        return True
+        
+    return False
 
 
 def classify_demand(predicted):
@@ -199,23 +225,57 @@ def check_expiry_status(expiry_date_str):
 
 
 def get_transfer_suggestions(product_id, current_branch, current_stock, items):
-    """Find branches with excess stock of same product."""
+    """Find branches with excess stock and calculate logistics feasibility."""
     suggestions = []
+    
+    # Mock distance logic: simply base on branch name or ID length for deterministic mock
+    def mock_distance(b1, b2):
+        return abs(hash(b1) - hash(b2)) % 150 + 10 # 10 to 160 km
+        
     for item in items:
         if (item.get("productId") == product_id and 
             item.get("branchId") != current_branch):
             other_stock = item.get("stockQuantity", 0)
+            other_branch = item.get("branchId")
+            
             if other_stock > 100 and current_stock < 30:
+                dist = mock_distance(current_branch, other_branch)
+                cost_per_km = 1.5 # INR/km
+                transport_cost = round(dist * cost_per_km, 2)
+                transfer_qty = min(50, other_stock - 50)
+                
                 suggestions.append({
-                    "fromBranch": item.get("branchId"),
-                    "quantity": min(50, other_stock - 50),
-                    "reason": f"Transfer {min(50, other_stock - 50)} from {item.get('branchId')}"
+                    "fromBranch": other_branch,
+                    "quantity": transfer_qty,
+                    "distanceKm": dist,
+                    "transportCost": transport_cost,
+                    "reason": f"Transfer {transfer_qty} from {other_branch}. Cost: ₹{transport_cost}",
+                    "score": transfer_qty - transport_cost # rough score to pick best (highest)
                 })
-    return suggestions[0] if suggestions else None
+    
+    if not suggestions:
+        return None
+        
+    # Sort and pick best
+    suggestions.sort(key=lambda x: x["score"], reverse=True)
+    best = suggestions[0]
+    del best["score"]
+    return best
 
 
 def smart_inventory_logic(item: dict, all_items: list = None):
-    stock = item.get("stockQuantity", 0)
+    # Base numbers
+    opening = item.get("openingStock", item.get("stockQuantity", 0))
+    purchases = item.get("purchases", 0)
+    sales_amount = item.get("sales", 0)
+    damaged = item.get("damaged", 0)
+    returns = item.get("returns", 0)
+    
+    # Smart Industry Stock Engine: Opening + Purchase − Sales − Damaged + Returns
+    # Note: Use item["stockQuantity"] directly if no deep tracking exists yet, but show the engine anyway
+    stock = (opening + purchases - sales_amount - damaged + returns) if (opening or purchases or returns) else item.get("stockQuantity", 0)
+    item["stockQuantity"] = stock
+    
     min_stock = item.get("minStockLevel", 0)
     last_week = item.get("lastWeekSales", 120)
     last_month = item.get("lastMonthSales", 500)
@@ -223,22 +283,37 @@ def smart_inventory_logic(item: dict, all_items: list = None):
     cost_price = item.get("costPrice", 0)
     expiry_date = item.get("expiryDate")
     product_id = item.get("productId")
+    
+    # New AI Prediction Inputs
+    seasonality = item.get("seasonality", 1) # Default to 1 (Winter)
+    day_of_week = datetime.now().weekday()
+    festival_effect = item.get("festivalEffect", 0)
+    lead_time = item.get("leadTimeDays", 3)
+    safety_stock = item.get("safetyStock", 20)
 
     predicted = 0
     if model:
-        predicted = predict_demand(model, last_week, last_month, stock)
+        predicted = predict_demand(model, last_week, last_month, stock, seasonality, day_of_week, festival_effect)
+
+    # Dynamic Reorder Engine
+    # Reorder Level = Avg Demand * Lead Time + Safety Stock
+    dynamic_reorder_level = int(round((predicted / 7) * lead_time + safety_stock))
+    item["dynamicReorderLevel"] = dynamic_reorder_level
 
     # Core smart fields
     item["predictedDemand"] = round(predicted, 2)
-    item["stockHealth"] = calculate_stock_health(stock, min_stock)
+    item["stockHealth"] = calculate_stock_health(stock, dynamic_reorder_level)
     item["stockStatus"] = classify_stock(stock)
-    item["forecastDays"] = forecast_days(stock, avg_daily_sales)
+    item["forecastDays"] = forecast_days(stock, round(predicted / 7, 2))
     item["recommendation"] = generate_recommendation(stock, predicted)
 
     # 🔥 NEW FEATURES 🔥
 
     # 1. Dead Stock Detection (query actual sales data)
-    item["isDeadStock"] = detect_dead_stock(product_id)
+    dead_stock_status = detect_dead_stock(product_id)
+    item["isDeadStock"] = (dead_stock_status is True)
+    item["isNewProduct"] = (dead_stock_status == "NEW_PRODUCT")
+    item["deadStockStatus"] = "DEAD STOCK" if dead_stock_status is True else "NEW PRODUCT" if dead_stock_status == "NEW_PRODUCT" else "ACTIVE" # For UI if needed
     
     # 2. Demand Classification
     item["demandCategory"] = classify_demand(predicted)
@@ -272,6 +347,9 @@ def smart_inventory_logic(item: dict, all_items: list = None):
     if item.get("isDeadStock"):
         item["recommendation"] = "Apply Discount / Clearance Sale"
         item["actionPriority"] = "High"
+    elif item.get("isNewProduct"):
+        item["recommendation"] = "New Product - Monitor Sales"
+        item["actionPriority"] = "Low"
     elif item.get("expiryStatus") == "Expiring Soon":
         item["recommendation"] = "Apply 20% Discount - Expiring Soon"
         item["actionPriority"] = "Critical"
@@ -375,3 +453,99 @@ def get_alerts():
             })
     
     return alerts
+
+@router.get("/smart-inventory/{productId}")
+def smart_inventory(productId: str):
+
+    # 🔹 Get product details
+    product = product_collection.find_one({"productId": productId}, {"_id": 0})
+    
+    if not product:
+        return {"message": "Product not found"}
+
+    category = product.get("category", "General")
+
+    # 🔹 Get inventory for this product across branches
+    inventory = list(inventory_collection.find({"productId": productId}, {"_id": 0}))
+
+    result = []
+
+    low_branch = None
+    high_branch = None
+
+    for item in inventory:
+        stock = item.get("stockQuantity", 0)
+        min_stock = item.get("minStockLevel", 20)
+        max_stock = item.get("maxStockLevel", 150)
+
+        # 🔥 Detect status
+        if stock < min_stock:
+            status = "Low Stock"
+            low_branch = item.get("branchId")
+        elif stock > max_stock:
+            status = "Overstock"
+            high_branch = item.get("branchId")
+        else:
+            status = "Normal"
+
+        item["status"] = status
+        
+        # 🔥 EXTRA SMART FEATURES
+        item["predictedDemand"] = round(max((stock * 0.8) + 10, 60))
+        if status == "Low Stock":
+            item["recommendation"] = f"Restock {min_stock - stock + 20} units"
+        elif status == "Overstock":
+            item["recommendation"] = f"Reduce {stock - max_stock + 10} units"
+        else:
+            item["recommendation"] = "Stock Balanced"
+            
+        result.append(item)
+
+    # 🔥 Suggest transfer
+    transfer = None
+    if low_branch and high_branch:
+        transfer = f"Transfer stock from {high_branch} → {low_branch}"
+
+    # 🔹 Get category products (like Rice, Wheat)
+    category_products = list(product_collection.find({"category": category}, {"_id": 0}))
+
+    return {
+        "product": product,
+        "category": category,
+        "inventory": result,
+        "transferSuggestion": transfer,
+        "categoryProducts": category_products
+    }
+
+
+
+@router.get("/category/{category_name}")
+def get_category_view(category_name: str):
+    """Category-level view (like Grocery, Electronics)"""
+    category_products = list(product_collection.find({"category": category_name}, {"_id": 0}))
+    
+    # If no products tracked strictly, try fetching distinct products from inventory that match this category
+    if not category_products:
+        invy_matches = list(inventory_collection.find({"category": category_name}, {"_id": 0}))
+        # build unique proxy products
+        unique_ids = set()
+        category_products = []
+        for match in invy_matches:
+            pid = match.get("productId")
+            if pid not in unique_ids:
+                unique_ids.add(pid)
+                category_products.append({
+                    "productId": pid,
+                    "name": match.get("productId", "Unknown Product"),
+                    "category": category_name
+                })
+
+    result = []
+    for p in category_products:
+        stock = list(inventory_collection.find({"productId": p.get("productId")}, {"_id": 0}))
+        result.append({
+            "product": p.get("name"),
+            "stock": stock
+        })
+
+    return result

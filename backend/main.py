@@ -4,7 +4,7 @@ import os
 
 from routes import (
     branch, product, inventory, sales, expense, 
-    analytics, alerts, prediction, ranking, dashboard, auth, export, supplier
+    analytics, alerts, prediction, ranking, dashboard, auth, export, supplier, decisions
 )
 
 app = FastAPI(title="DMart API + ML Backend")
@@ -31,6 +31,7 @@ app.include_router(alerts.router)
 app.include_router(prediction.router)
 app.include_router(ranking.router)
 app.include_router(dashboard.router)
+app.include_router(decisions.router)
 
 # Auth
 app.include_router(auth.router)
